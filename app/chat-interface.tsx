@@ -82,8 +82,7 @@ export function ChatInterface({ messages, sources, newsResults, imageResults, fo
   
   const showInitialLoading =
     isWaitingForResponse &&
-    !lastAssistantContent &&
-    (sources.length === 0 && newsResults.length === 0 && imageResults.length === 0)
+    (!lastAssistantContent || lastAssistantContent.trim().length === 0)
 
   // Auto-scroll to bottom when new content appears
   useEffect(() => {

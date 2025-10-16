@@ -182,41 +182,43 @@ export async function POST(request: Request) {
             return json || {}
           }
 
-          // Base web search is required
-          const webData = await performSourceSearch(searxGeneralCategory)
-
-          // Optional sources - failure should not abort the entire flow
-          let newsData: Record<string, any> = {}
-          let imagesData: Record<string, any> = {}
-
-          try {
-            newsData = await performSourceSearch(searxNewsCategory)
-          } catch (error) {
-            console.warn('[fireplexity] news source unavailable', {
-              requestId,
-              message: error instanceof Error ? error.message : error
-            })
-          }
-
-          try {
-            imagesData = await performSourceSearch(searxImagesCategory)
-          } catch (error) {
-            console.warn('[fireplexity] images source unavailable', {
-              requestId,
-              message: error instanceof Error ? error.message : error
-            })
-          }
+          // Run SearxNG queries in parallel (web/news/images)
+          const [webData, newsData, imagesData] = await Promise.all([
+            performSourceSearch(searxGeneralCategory),
+            (async () => {
+              try {
+                return await performSourceSearch(searxNewsCategory)
+              } catch (error) {
+                console.warn('[fireplexity] news source unavailable', {
+                  requestId,
+                  message: error instanceof Error ? error.message : error
+                })
+                return null
+              }
+            })(),
+            (async () => {
+              try {
+                return await performSourceSearch(searxImagesCategory)
+              } catch (error) {
+                console.warn('[fireplexity] images source unavailable', {
+                  requestId,
+                  message: error instanceof Error ? error.message : error
+                })
+                return null
+              }
+            })()
+          ])
 
           // Extract results from SearxNG responses (falling back when instances map data differently)
           const webResults = Array.isArray(webData.results) ? webData.results : []
-          const newsSource = Array.isArray(newsData.results)
+          const newsSource = Array.isArray(newsData?.results)
             ? newsData.results
-            : Array.isArray(newsData.news)
+            : Array.isArray(newsData?.news)
             ? newsData.news
             : []
-          const imageSource = Array.isArray(imagesData.results)
+          const imageSource = Array.isArray(imagesData?.results)
             ? imagesData.results
-            : Array.isArray(imagesData.images)
+            : Array.isArray(imagesData?.images)
             ? imagesData.images
             : []
           
@@ -261,60 +263,6 @@ export async function POST(request: Request) {
               image?: string
               siteName?: string
             }>
-
-          // Optionally enrich top sources with Firecrawl scraping for markdown/context
-          if (sources.length > 0) {
-            writer.write({
-              type: 'data-status',
-              id: 'status-3a',
-              data: { message: 'Fetching full article content...' },
-              transient: true
-            })
-
-            const firecrawlScrapeEndpoint = `${firecrawlBaseUrl.replace(/\/$/, '')}/v1/scrape`
-            const parsedLimit = Number(process.env.FIRECRAWL_SCRAPE_LIMIT ?? 5)
-            const scrapeLimit = Number.isFinite(parsedLimit) && parsedLimit > 0 ? Math.floor(parsedLimit) : 5
-            const targets = sources.slice(0, Math.max(1, scrapeLimit))
-
-            const scraped = await Promise.allSettled(
-              targets.map(async (source) => {
-                const scrapeResponse = await fetch(firecrawlScrapeEndpoint, {
-                  method: 'POST',
-                  headers: {
-                    'Authorization': `Bearer ${firecrawlApiKey}`,
-                    'Content-Type': 'application/json'
-                  },
-                  body: JSON.stringify({
-                    url: source.url,
-                    formats: ['markdown'],
-                    onlyMainContent: true
-                  })
-                })
-
-                if (!scrapeResponse.ok) {
-                  const errorData = await scrapeResponse.json().catch(() => ({}))
-                  throw new Error(errorData.error || scrapeResponse.statusText)
-                }
-
-                const scrapeJson = await scrapeResponse.json()
-                return {
-                  url: source.url,
-                  markdown: scrapeJson.data?.markdown || undefined,
-                  content: scrapeJson.data?.content || undefined
-                }
-              })
-            )
-
-            scraped.forEach((result) => {
-              if (result.status === 'fulfilled') {
-                const match = sources.find((s) => s.url === result.value.url)
-                if (match) {
-                  match.markdown = result.value.markdown || match.markdown
-                  match.content = result.value.content || match.content
-                }
-              }
-            })
-          }
 
           // Transform news results from SearxNG output (with fallbacks)
           newsResults = newsSource.map((item: any) => {
@@ -371,19 +319,93 @@ export async function POST(request: Request) {
             };
           }).filter(Boolean) || []  // Filter out null entries
           
-          // Send all sources as a persistent data part
-          writer.write({
-            type: 'data-sources',
-            id: 'sources-1',
-            data: {
-              sources,
-              newsResults,
-              imageResults
-            }
-          })
-          
-          // Small delay to ensure sources render first
-          await new Promise(resolve => setTimeout(resolve, 300))
+          // Optionally enrich top sources with Firecrawl scraping for markdown/context
+          if (sources.length > 0) {
+            writer.write({
+              type: 'data-status',
+              id: 'status-3a',
+              data: { message: 'Fetching full article content...' },
+              transient: true
+            })
+
+            const firecrawlScrapeEndpoint = `${firecrawlBaseUrl.replace(/\/$/, '')}/v1/scrape`
+            const parsedLimit = Number(process.env.FIRECRAWL_SCRAPE_LIMIT ?? 5)
+            const scrapeLimit = Number.isFinite(parsedLimit) && parsedLimit > 0 ? Math.floor(parsedLimit) : 5
+            const targets = sources.slice(0, Math.max(1, scrapeLimit))
+
+            const scraped = await Promise.allSettled(
+              targets.map(async (source) => {
+                const scrapeResponse = await fetch(firecrawlScrapeEndpoint, {
+                  method: 'POST',
+                  headers: {
+                    'Authorization': `Bearer ${firecrawlApiKey}`,
+                    'Content-Type': 'application/json'
+                  },
+                  body: JSON.stringify({
+                    url: source.url,
+                    formats: ['markdown'],
+                    onlyMainContent: true
+                  })
+                })
+
+                if (!scrapeResponse.ok) {
+                  const errorData = await scrapeResponse.json().catch(() => ({}))
+                  throw new Error(errorData.error || scrapeResponse.statusText)
+                }
+
+                const scrapeJson = await scrapeResponse.json()
+                return {
+                  url: source.url,
+                  markdown: scrapeJson.data?.markdown || undefined,
+                  content: scrapeJson.data?.content || undefined
+                }
+              })
+            )
+
+            scraped.forEach((result) => {
+              if (result.status === 'fulfilled') {
+                const match = sources.find((s) => s.url === result.value.url)
+                if (match) {
+                  match.markdown = result.value.markdown || match.markdown
+                  match.content = result.value.content || match.content
+                }
+              }
+            })
+
+            // Send an updated payload so UI components can reflect enriched content if needed
+            writer.write({
+              type: 'data-sources',
+              id: 'sources-1',
+              data: {
+                sources,
+                newsResults,
+                imageResults
+              }
+            })
+          } else {
+            // Even without enrichment, send the collected sources to the client
+            writer.write({
+              type: 'data-sources',
+              id: 'sources-1',
+              data: {
+                sources,
+                newsResults,
+                imageResults
+              }
+            })
+          }
+
+          if (sources.length > 0) {
+            writer.write({
+              type: 'data-status',
+              id: 'status-2b',
+              data: { message: 'Analyzing detailed content...' },
+              transient: true
+            })
+          }
+
+          // Small delay to ensure sources render/update before proceeding
+          await new Promise(resolve => setTimeout(resolve, 150))
           
           // Update status
           writer.write({
