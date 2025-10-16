@@ -80,6 +80,11 @@ export function ChatInterface({ messages, sources, newsResults, imageResults, fo
   const lastAssistantErrorPart = lastAssistantMessage?.parts?.find((part: any) => part.type === 'data-error')
   const lastAssistantError = lastAssistantErrorPart?.data as { error: string; suggestion?: string; statusCode?: number } | undefined
   
+  const showInitialLoading =
+    isWaitingForResponse &&
+    !lastAssistantContent &&
+    (sources.length === 0 && newsResults.length === 0 && imageResults.length === 0)
+
   // Auto-scroll to bottom when new content appears
   useEffect(() => {
     if (!scrollContainerRef.current) return
@@ -156,6 +161,21 @@ export function ChatInterface({ messages, sources, newsResults, imageResults, fo
             isolation: 'isolate'
           } as React.CSSProperties}
         >
+          {showInitialLoading && (
+            <div className="max-w-4xl mx-auto space-y-6 pb-8">
+              {query && (
+                <div className="opacity-0 animate-fade-up [animation-duration:500ms] [animation-fill-mode:forwards]">
+                  <h1 className="text-2xl font-semibold text-gray-900 dark:text-white mb-6">{query}</h1>
+                </div>
+              )}
+              <div className="flex items-center justify-center h-[40vh]">
+                <div className="flex flex-col items-center gap-3 text-gray-500 dark:text-gray-400 animate-in fade-in duration-300">
+                  <Loader2 className="h-10 w-10 animate-spin text-orange-500" />
+                  <p className="text-sm">Searching sources…</p>
+                </div>
+              </div>
+            </div>
+          )}
           {lastAssistantError && !lastAssistantContent && (
             <div className="max-w-4xl mx-auto mb-6">
               <div className="rounded-lg border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-800 dark:border-red-900 dark:bg-red-950 dark:text-red-200">
@@ -382,7 +402,7 @@ export function ChatInterface({ messages, sources, newsResults, imageResults, fo
 
           {/* Current conversation - always at the bottom */}
           {/* Current Query display */}
-          {query && (messages.length <= 2 || messages[messages.length - 1]?.role === 'user' || messages[messages.length - 1]?.role === 'assistant') && (
+          {!showInitialLoading && query && (messages.length <= 2 || messages[messages.length - 1]?.role === 'user' || messages[messages.length - 1]?.role === 'assistant') && (
             <div className="opacity-0 animate-fade-up [animation-duration:500ms] [animation-fill-mode:forwards]">
               <h1 className="text-2xl font-semibold text-gray-900 dark:text-white mb-6">{query}</h1>
             </div>
