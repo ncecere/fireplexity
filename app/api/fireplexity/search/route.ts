@@ -33,6 +33,13 @@ export async function POST(request: Request) {
     // Always read credentials from the environment so the same config applies to every user
     const firecrawlApiKey = process.env.FIRECRAWL_API_KEY
     const firecrawlBaseUrl = process.env.FIRECRAWL_BASE_URL || 'https://api.firecrawl.dev'
+    const searxBaseUrlEnv = process.env.SEARXNG_BASE_URL
+    const searxApiKey = process.env.SEARXNG_API_KEY
+    const searxLanguage = process.env.SEARXNG_LANGUAGE
+    const searxSafeSearch = process.env.SEARXNG_SAFESEARCH
+    const searxGeneralCategory = process.env.SEARXNG_GENERAL_CATEGORY || 'general'
+    const searxNewsCategory = process.env.SEARXNG_NEWS_CATEGORY || 'news'
+    const searxImagesCategory = process.env.SEARXNG_IMAGES_CATEGORY || 'images'
     const openAIApiKey = process.env.OPENAI_API_KEY
     const openAIBaseUrl = process.env.OPENAI_BASE_URL
     const openAIModel = process.env.OPENAI_MODEL || 'gpt-4o-mini'
@@ -45,6 +52,12 @@ export async function POST(request: Request) {
     if (!openAIApiKey) {
       return NextResponse.json({ error: 'OpenAI API key not configured' }, { status: 500 })
     }
+
+    if (!searxBaseUrlEnv) {
+      return NextResponse.json({ error: 'SearxNG base URL not configured' }, { status: 500 })
+    }
+
+    const searxBaseUrl = searxBaseUrlEnv.replace(/\/$/, '')
 
     // Configure OpenAI client using the AI SDK with optional custom base URL
     const openai = createOpenAI({
@@ -119,81 +132,239 @@ export async function POST(request: Request) {
             data: { message: 'Searching for relevant sources...' },
             transient: true
           })
-          
-          // Make direct API call to Firecrawl v2 search endpoint
+          // Normalized search endpoint
           const baseUrl = firecrawlBaseUrl.endsWith('/')
             ? firecrawlBaseUrl.slice(0, -1)
             : firecrawlBaseUrl
           const searchEndpoint = `${baseUrl}/v2/search`
 
-          const searchResponse = await fetch(searchEndpoint, {
-            method: 'POST',
-            headers: {
-              'Authorization': `Bearer ${firecrawlApiKey}`,
-              'Content-Type': 'application/json'
-            },
-            body: JSON.stringify({
-              query: query,
-              sources: ['web', 'news', 'images'],
-              limit: 6,
-              scrapeOptions: {
-                formats: ['markdown'],
-                onlyMainContent: true,
-                maxAge: 86400000  // 24 hours in milliseconds
+          // Helper to perform a SearxNG search for a specific source/category
+          const performSourceSearch = async (category: string | null) => {
+            const params = new URLSearchParams({
+              q: query,
+              format: 'json'
+            })
+
+            if (category) {
+              params.set('categories', category)
+            }
+
+            if (searxLanguage) {
+              params.set('language', searxLanguage)
+            }
+
+            if (searxSafeSearch) {
+              params.set('safesearch', searxSafeSearch)
+            }
+
+            if (searxApiKey) {
+              params.set('api_key', searxApiKey)
+            }
+
+            const searxSearchUrl = new URL('/search', `${searxBaseUrl}/`)
+            searxSearchUrl.search = params.toString()
+
+            const response = await fetch(searxSearchUrl.toString(), {
+              method: 'GET',
+              headers: {
+                'Accept': 'application/json'
               }
             })
-          })
 
-          if (!searchResponse.ok) {
-            const errorData = await searchResponse.json()
-            throw new Error(`Firecrawl API error: ${errorData.error || searchResponse.statusText}`)
+            if (!response.ok) {
+              const errorData = await response.json().catch(() => ({}))
+              throw new Error(
+                `SearxNG search error: ${errorData.error || response.statusText}`
+              )
+            }
+
+            const json = await response.json()
+            return json || {}
           }
 
-          const searchResult = await searchResponse.json()
-          const searchData = searchResult.data || {}
-          
-          // Extract results from the v2 SDK response
-          const webResults = searchData.web || []
-          const newsData = searchData.news || []
-          const imagesData = searchData.images || []
-          
-          // Transform web sources metadata
-          sources = webResults.map((item: any) => {
-            return {
-              url: item.url,
-              title: item.title || item.url,
-              description: item.description || item.snippet,
-              content: item.content,
-              markdown: item.markdown,
-              favicon: item.favicon,
-              image: item.ogImage || item.image || item.metadata?.ogImage,  // Add ogImage support
-              siteName: new URL(item.url).hostname
-            };
-          }).filter((item: any) => item.url) || []
+          // Base web search is required
+          const webData = await performSourceSearch(searxGeneralCategory)
 
-          // Transform news results - now with correct schema
-          newsResults = newsData.map((item: any) => {
+          // Optional sources - failure should not abort the entire flow
+          let newsData: Record<string, any> = {}
+          let imagesData: Record<string, any> = {}
+
+          try {
+            newsData = await performSourceSearch(searxNewsCategory)
+          } catch (error) {
+            console.warn('[fireplexity] news source unavailable', {
+              requestId,
+              message: error instanceof Error ? error.message : error
+            })
+          }
+
+          try {
+            imagesData = await performSourceSearch(searxImagesCategory)
+          } catch (error) {
+            console.warn('[fireplexity] images source unavailable', {
+              requestId,
+              message: error instanceof Error ? error.message : error
+            })
+          }
+
+          // Extract results from SearxNG responses (falling back when instances map data differently)
+          const webResults = Array.isArray(webData.results) ? webData.results : []
+          const newsSource = Array.isArray(newsData.results)
+            ? newsData.results
+            : Array.isArray(newsData.news)
+            ? newsData.news
+            : []
+          const imageSource = Array.isArray(imagesData.results)
+            ? imagesData.results
+            : Array.isArray(imagesData.images)
+            ? imagesData.images
+            : []
+          
+          const buildHostInfo = (url: string | undefined) => {
+            if (!url) return { host: undefined, siteName: undefined }
+            try {
+              const { hostname } = new URL(url)
+              const cleaned = hostname.replace(/^www\./, '')
+              return { host: hostname, siteName: cleaned }
+            } catch {
+              return { host: undefined, siteName: undefined }
+            }
+          }
+
+          const buildFavicon = (host: string | undefined) =>
+            host ? `https://www.google.com/s2/favicons?domain=${host}&sz=64` : undefined
+          
+          // Transform general web sources
+          sources = webResults
+            .map((item: any) => {
+              const url = item.url || item.href || item.link
+              if (!url) return null
+              const { host, siteName } = buildHostInfo(url)
+              return {
+                url,
+                title: item.title || url,
+                description: item.content || item.summary || item.abstract,
+                content: item.content,
+                markdown: undefined as string | undefined,
+                favicon: buildFavicon(host),
+                image: item.img_src || item.thumbnail || item.image,
+                siteName: siteName || host
+              }
+            })
+            .filter(Boolean) as Array<{
+              url: string
+              title: string
+              description?: string
+              content?: string
+              markdown?: string
+              favicon?: string
+              image?: string
+              siteName?: string
+            }>
+
+          // Optionally enrich top sources with Firecrawl scraping for markdown/context
+          if (sources.length > 0) {
+            writer.write({
+              type: 'data-status',
+              id: 'status-3a',
+              data: { message: 'Fetching full article content...' },
+              transient: true
+            })
+
+            const firecrawlScrapeEndpoint = `${firecrawlBaseUrl.replace(/\/$/, '')}/v1/scrape`
+            const parsedLimit = Number(process.env.FIRECRAWL_SCRAPE_LIMIT ?? 5)
+            const scrapeLimit = Number.isFinite(parsedLimit) && parsedLimit > 0 ? Math.floor(parsedLimit) : 5
+            const targets = sources.slice(0, Math.max(1, scrapeLimit))
+
+            const scraped = await Promise.allSettled(
+              targets.map(async (source) => {
+                const scrapeResponse = await fetch(firecrawlScrapeEndpoint, {
+                  method: 'POST',
+                  headers: {
+                    'Authorization': `Bearer ${firecrawlApiKey}`,
+                    'Content-Type': 'application/json'
+                  },
+                  body: JSON.stringify({
+                    url: source.url,
+                    formats: ['markdown'],
+                    onlyMainContent: true
+                  })
+                })
+
+                if (!scrapeResponse.ok) {
+                  const errorData = await scrapeResponse.json().catch(() => ({}))
+                  throw new Error(errorData.error || scrapeResponse.statusText)
+                }
+
+                const scrapeJson = await scrapeResponse.json()
+                return {
+                  url: source.url,
+                  markdown: scrapeJson.data?.markdown || undefined,
+                  content: scrapeJson.data?.content || undefined
+                }
+              })
+            )
+
+            scraped.forEach((result) => {
+              if (result.status === 'fulfilled') {
+                const match = sources.find((s) => s.url === result.value.url)
+                if (match) {
+                  match.markdown = result.value.markdown || match.markdown
+                  match.content = result.value.content || match.content
+                }
+              }
+            })
+          }
+
+          // Transform news results from SearxNG output (with fallbacks)
+          newsResults = newsSource.map((item: any) => {
+            const itemUrl = item.url || item.link || item.pageUrl || item.sourceUrl;
+            const imageUrl =
+              item.imageUrl ||
+              item.image_url ||
+              item.image ||
+              item.thumbnail ||
+              item.thumbnailUrl ||
+              item.img_src ||
+              item.img ||
+              item.img_srcset;
+            const publishedDate =
+              item.date ||
+              item.publishedDate ||
+              item.published_at ||
+              item.publishedAt ||
+              item.published ||
+              item.time;
+            const { siteName } = buildHostInfo(itemUrl)
             return {
-              url: item.url,
+              url: itemUrl,
               title: item.title,
-              description: item.snippet || item.description,
-              publishedDate: item.date,  // Direct API returns 'date' field
-              source: item.source || (item.url ? new URL(item.url).hostname : undefined),
-              image: item.imageUrl  // Direct API returns 'imageUrl' for news thumbnails
+              description: item.content || item.summary || item.description,
+              publishedDate,
+              source: item.source || item.engines?.[0] || siteName,
+              image: imageUrl  // Support different key names
             };
           }).filter((item: any) => item.url) || []
 
-          // Transform image results - now with correct schema from direct API
-          imageResults = imagesData.map((item: any) => {
-            // Verify we have the required fields
-            if (!item.url || !item.imageUrl) {
+          // Transform image results - support multiple field names from API variations
+          imageResults = imageSource.map((item: any) => {
+            const targetUrl = item.url || item.link || item.pageUrl || item.sourceUrl || item.img_src;
+            const imageUrl =
+              item.imageUrl ||
+              item.image_url ||
+              item.image ||
+              item.thumbnail ||
+              item.thumbnailUrl ||
+              item.img_src ||
+              item.thumbnail_src;
+            if (!targetUrl) {
               return null;
             }
             return {
-              url: item.url,
+              url: targetUrl,
               title: item.title || 'Untitled',
-              thumbnail: item.imageUrl,  // Direct API returns 'imageUrl' field
-              source: item.url ? new URL(item.url).hostname : undefined,
+              thumbnail: imageUrl,
+              source: buildHostInfo(targetUrl).siteName,
               width: item.imageWidth,
               height: item.imageHeight,
               position: item.position
