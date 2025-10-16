@@ -77,8 +77,12 @@ export function ChatInterface({ messages, sources, newsResults, imageResults, fo
 
   const lastAssistantMessage = [...messages].reverse().find(m => m.role === 'assistant')
   const lastAssistantContent = lastAssistantMessage ? getMessageContent(lastAssistantMessage) : ''
-  const lastAssistantErrorPart = lastAssistantMessage?.parts?.find((part: any) => part.type === 'data-error')
-  const lastAssistantError = lastAssistantErrorPart?.data as { error: string; suggestion?: string; statusCode?: number } | undefined
+  const lastAssistantErrorPart = lastAssistantMessage?.parts?.find(
+    (part: any) => part.type === 'data-error' && part && typeof part === 'object' && 'data' in part
+  )
+  const lastAssistantError = lastAssistantErrorPart && 'data' in lastAssistantErrorPart
+    ? (lastAssistantErrorPart.data as { error: string; suggestion?: string; statusCode?: number })
+    : undefined
   
   const showInitialLoading =
     isWaitingForResponse &&
