@@ -167,10 +167,9 @@ export function ChatInterface({ messages, sources, newsResults, imageResults, fo
                   <h1 className="text-2xl font-semibold text-gray-900 dark:text-white mb-6">{query}</h1>
                 </div>
               )}
-              <div className="flex items-center justify-center h-[40vh]">
-                <div className="flex flex-col items-center gap-3 text-gray-500 dark:text-gray-400 animate-in fade-in duration-300">
-                  <Loader2 className="h-10 w-10 animate-spin text-orange-500" />
-                  <p className="text-sm">Searching sources…</p>
+              <div className="flex items-center justify-center h-[32vh]">
+                <div className="px-4 py-3 rounded-xl border border-dashed border-gray-300 dark:border-gray-700 text-sm text-gray-600 dark:text-gray-400 animate-in fade-in duration-300">
+                  Preparing answer…
                 </div>
               </div>
             </div>

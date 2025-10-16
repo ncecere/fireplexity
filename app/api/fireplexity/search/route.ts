@@ -5,6 +5,49 @@ import type { ModelMessage } from 'ai'
 import { detectCompanyTicker } from '@/lib/company-ticker-map'
 import { selectRelevantContent } from '@/lib/content-selection'
 
+const DEFAULT_CONTEXT_SOURCE_LIMIT = Number(process.env.CONTEXT_SOURCE_LIMIT ?? '4') || 4
+const FIRECRAWL_CONCURRENCY = Math.max(1, Number(process.env.FIRECRAWL_CONCURRENCY ?? '2') || 2)
+
+type EnrichableSource = {
+  url: string
+  title: string
+  description?: string
+  content?: string
+  markdown?: string
+}
+
+function shouldEnrichSource(source: EnrichableSource) {
+  const existing = source.markdown || source.content || source.description || ''
+  return existing.trim().length < 600
+}
+
+function getDynamicScrapeLimit(baseLimit: number, query: string, sources: EnrichableSource[]) {
+  let limit = Math.max(0, baseLimit)
+  if (query.length < 60) {
+    limit = Math.min(limit, 3)
+  }
+  if (query.length < 30) {
+    limit = Math.min(limit, 2)
+  }
+  const available = sources.filter(shouldEnrichSource).length
+  limit = Math.min(limit, available)
+  return limit
+}
+
+async function runLimited<T>(items: T[], limit: number, worker: (item: T) => Promise<void>) {
+  let nextIndex = 0
+  const workers = Array.from({ length: Math.min(limit, items.length) }, async () => {
+    while (true) {
+      const current = nextIndex++
+      if (current >= items.length) {
+        break
+      }
+      await worker(items[current])
+    }
+  })
+  await Promise.all(workers)
+}
+
 export async function POST(request: Request) {
   const requestId = Math.random().toString(36).substring(7)
   
@@ -117,6 +160,7 @@ export async function POST(request: Request) {
             position?: number
           }> = []
           let context = ''
+          let enrichmentPromise: Promise<void> | null = null
           
           // Send status updates as transient data parts
           writer.write({
@@ -319,81 +363,71 @@ export async function POST(request: Request) {
             };
           }).filter(Boolean) || []  // Filter out null entries
           
-          // Optionally enrich top sources with Firecrawl scraping for markdown/context
-          if (sources.length > 0) {
-            writer.write({
-              type: 'data-status',
-              id: 'status-3a',
-              data: { message: 'Fetching full article content...' },
-              transient: true
-            })
+          // Send initial sources/news/images immediately
+          writer.write({
+            type: 'data-sources',
+            id: 'sources-1',
+            data: {
+              sources,
+              newsResults,
+              imageResults
+            }
+          })
 
-            const firecrawlScrapeEndpoint = `${firecrawlBaseUrl.replace(/\/$/, '')}/v1/scrape`
-            const parsedLimit = Number(process.env.FIRECRAWL_SCRAPE_LIMIT ?? 5)
-            const scrapeLimit = Number.isFinite(parsedLimit) && parsedLimit > 0 ? Math.floor(parsedLimit) : 5
-            const targets = sources.slice(0, Math.max(1, scrapeLimit))
+          const parsedLimit = Number(process.env.FIRECRAWL_SCRAPE_LIMIT ?? 5)
+          const baseScrapeLimit = Number.isFinite(parsedLimit) && parsedLimit > 0 ? Math.floor(parsedLimit) : 0
+          const dynamicLimit = getDynamicScrapeLimit(baseScrapeLimit, query, sources)
+          const firecrawlScrapeEndpoint = `${firecrawlBaseUrl.replace(/\/$/, '')}/v1/scrape`
+          const enrichmentTargets = dynamicLimit > 0
+            ? sources.filter(shouldEnrichSource).slice(0, dynamicLimit)
+            : []
 
-            const scraped = await Promise.allSettled(
-              targets.map(async (source) => {
-                const scrapeResponse = await fetch(firecrawlScrapeEndpoint, {
-                  method: 'POST',
-                  headers: {
-                    'Authorization': `Bearer ${firecrawlApiKey}`,
-                    'Content-Type': 'application/json'
-                  },
-                  body: JSON.stringify({
-                    url: source.url,
-                    formats: ['markdown'],
-                    onlyMainContent: true
+          enrichmentPromise = enrichmentTargets.length > 0
+            ? (async () => {
+                await runLimited(enrichmentTargets, FIRECRAWL_CONCURRENCY, async (source) => {
+                  const scrapeResponse = await fetch(firecrawlScrapeEndpoint, {
+                    method: 'POST',
+                    headers: {
+                      'Authorization': `Bearer ${firecrawlApiKey}`,
+                      'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify({
+                      url: source.url,
+                      formats: ['markdown'],
+                      onlyMainContent: true
+                    })
                   })
+
+                  if (!scrapeResponse.ok) {
+                    const errorData = await scrapeResponse.json().catch(() => ({}))
+                    throw new Error(errorData.error || scrapeResponse.statusText)
+                  }
+
+                  const scrapeJson = await scrapeResponse.json()
+                  if (scrapeJson?.data?.markdown) {
+                    source.markdown = scrapeJson.data.markdown
+                  }
+                  if (scrapeJson?.data?.content) {
+                    source.content = scrapeJson.data.content
+                  }
                 })
 
-                if (!scrapeResponse.ok) {
-                  const errorData = await scrapeResponse.json().catch(() => ({}))
-                  throw new Error(errorData.error || scrapeResponse.statusText)
-                }
-
-                const scrapeJson = await scrapeResponse.json()
-                return {
-                  url: source.url,
-                  markdown: scrapeJson.data?.markdown || undefined,
-                  content: scrapeJson.data?.content || undefined
-                }
+                writer.write({
+                  type: 'data-sources',
+                  id: 'sources-1',
+                  data: {
+                    sources,
+                    newsResults,
+                    imageResults
+                  }
+                })
+              })().catch((error) => {
+                console.warn('[fireplexity] firecrawl enrichment failed', {
+                  requestId,
+                  message: error instanceof Error ? error.message : error
+                })
               })
-            )
-
-            scraped.forEach((result) => {
-              if (result.status === 'fulfilled') {
-                const match = sources.find((s) => s.url === result.value.url)
-                if (match) {
-                  match.markdown = result.value.markdown || match.markdown
-                  match.content = result.value.content || match.content
-                }
-              }
-            })
-
-            // Send an updated payload so UI components can reflect enriched content if needed
-            writer.write({
-              type: 'data-sources',
-              id: 'sources-1',
-              data: {
-                sources,
-                newsResults,
-                imageResults
-              }
-            })
-          } else {
-            // Even without enrichment, send the collected sources to the client
-            writer.write({
-              type: 'data-sources',
-              id: 'sources-1',
-              data: {
-                sources,
-                newsResults,
-                imageResults
-              }
-            })
-          }
+            : null
 
           if (sources.length > 0) {
             writer.write({
@@ -426,10 +460,11 @@ export async function POST(request: Request) {
           }
           
           // Prepare context from sources with intelligent content selection
-          context = sources
-            .map((source: { title: string; markdown?: string; content?: string; url: string }, index: number) => {
-              const content = source.markdown || source.content || ''
-              const relevantContent = selectRelevantContent(content, query, 2000)
+          const contextSources = sources.slice(0, DEFAULT_CONTEXT_SOURCE_LIMIT)
+          context = contextSources
+            .map((source: { title: string; markdown?: string; content?: string; description?: string; url: string }, index: number) => {
+              const baseContent = source.markdown || source.content || source.description || ''
+              const relevantContent = selectRelevantContent(baseContent, query, 2000)
               return `[${index + 1}] ${source.title}\nURL: ${source.url}\n${relevantContent}`
             })
             .join('\n\n---\n\n')
@@ -512,6 +547,14 @@ export async function POST(request: Request) {
           
           // Get the full answer for follow-up generation
           const fullAnswer = await result.text
+
+          if (enrichmentPromise) {
+            try {
+              await enrichmentPromise
+            } catch {
+              // already logged
+            }
+          }
           
           // Generate follow-up questions
           const conversationPreview = isFollowUp 
