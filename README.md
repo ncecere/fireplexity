@@ -21,7 +21,11 @@ cp .env.example .env.local
 Add your keys to `.env.local`:
 ```
 FIRECRAWL_API_KEY=fc-your-api-key
-GROQ_API_KEY=gsk_your-groq-api-key
+FIRECRAWL_BASE_URL=https://api.firecrawl.dev
+OPENAI_API_KEY=sk-your-openai-api-key
+OPENAI_BASE_URL=https://api.openai.com/v1       # optional
+OPENAI_MODEL=gpt-4o-mini                        # optional
+OPENAI_API_MODE=chat                            # optional (use chat for chat-completions proxies)
 ```
 
 ## Run
@@ -39,6 +43,6 @@ Open http://localhost:3000
 ## Get API Keys
 
 - [Firecrawl](https://firecrawl.dev)
-- [Groq](https://groq.com)
+- [OpenAI (or compatible proxy)](https://platform.openai.com)
 
 MIT License

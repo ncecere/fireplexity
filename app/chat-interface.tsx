@@ -74,6 +74,11 @@ export function ChatInterface({ messages, sources, newsResults, imageResults, fo
   }
 
   const scrollContainerRef = useRef<HTMLDivElement>(null)
+
+  const lastAssistantMessage = [...messages].reverse().find(m => m.role === 'assistant')
+  const lastAssistantContent = lastAssistantMessage ? getMessageContent(lastAssistantMessage) : ''
+  const lastAssistantErrorPart = lastAssistantMessage?.parts?.find((part: any) => part.type === 'data-error')
+  const lastAssistantError = lastAssistantErrorPart?.data as { error: string; suggestion?: string; statusCode?: number } | undefined
   
   // Auto-scroll to bottom when new content appears
   useEffect(() => {
@@ -151,6 +156,16 @@ export function ChatInterface({ messages, sources, newsResults, imageResults, fo
             isolation: 'isolate'
           } as React.CSSProperties}
         >
+          {lastAssistantError && !lastAssistantContent && (
+            <div className="max-w-4xl mx-auto mb-6">
+              <div className="rounded-lg border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-800 dark:border-red-900 dark:bg-red-950 dark:text-red-200">
+                <p className="font-medium">{lastAssistantError.error}</p>
+                {lastAssistantError.suggestion && (
+                  <p className="mt-1 text-xs sm:text-sm text-red-700 dark:text-red-300">{lastAssistantError.suggestion}</p>
+                )}
+              </div>
+            </div>
+          )}
           <div className="max-w-4xl mx-auto space-y-6 pb-8">
           {/* Previous conversations */}
           {messages.length > 2 && (

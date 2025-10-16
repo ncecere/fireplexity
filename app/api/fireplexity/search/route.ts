@@ -1,5 +1,5 @@
 import { NextResponse } from 'next/server'
-import { createGroq } from '@ai-sdk/groq'
+import { createOpenAI } from '@ai-sdk/openai'
 import { streamText, generateText, createUIMessageStream, createUIMessageStreamResponse, convertToModelMessages } from 'ai'
 import type { ModelMessage } from 'ai'
 import { detectCompanyTicker } from '@/lib/company-ticker-map'
@@ -30,22 +30,41 @@ export async function POST(request: Request) {
       return NextResponse.json({ error: 'Query is required' }, { status: 400 })
     }
 
-    // Use API key from request body if provided, otherwise fall back to environment variable
-    const firecrawlApiKey = body.firecrawlApiKey || process.env.FIRECRAWL_API_KEY
-    const groqApiKey = process.env.GROQ_API_KEY
+    // Always read credentials from the environment so the same config applies to every user
+    const firecrawlApiKey = process.env.FIRECRAWL_API_KEY
+    const firecrawlBaseUrl = process.env.FIRECRAWL_BASE_URL || 'https://api.firecrawl.dev'
+    const openAIApiKey = process.env.OPENAI_API_KEY
+    const openAIBaseUrl = process.env.OPENAI_BASE_URL
+    const openAIModel = process.env.OPENAI_MODEL || 'gpt-4o-mini'
+    const openAIProviderMode = process.env.OPENAI_API_MODE?.toLowerCase() || 'responses'
     
     if (!firecrawlApiKey) {
       return NextResponse.json({ error: 'Firecrawl API key not configured' }, { status: 500 })
     }
     
-    if (!groqApiKey) {
-      return NextResponse.json({ error: 'Groq API key not configured' }, { status: 500 })
+    if (!openAIApiKey) {
+      return NextResponse.json({ error: 'OpenAI API key not configured' }, { status: 500 })
     }
 
-    // Configure Groq with the OSS 120B model
-    const groq = createGroq({
-      apiKey: groqApiKey
+    // Configure OpenAI client using the AI SDK with optional custom base URL
+    const openai = createOpenAI({
+      apiKey: openAIApiKey,
+      baseURL: openAIBaseUrl
     })
+    const selectModel = () => {
+      switch (openAIProviderMode) {
+        case 'chat':
+        case 'chat-completions':
+          return openai.chat(openAIModel)
+        case 'completions':
+        case 'completion':
+          return openai.completion(openAIModel)
+        case 'responses':
+        default:
+          return openai(openAIModel)
+      }
+    }
+    const getOpenAITextModel = () => selectModel()
 
     // Always perform a fresh search for each query to ensure relevant results
     const isFollowUp = messages.length > 2
@@ -102,7 +121,12 @@ export async function POST(request: Request) {
           })
           
           // Make direct API call to Firecrawl v2 search endpoint
-          const searchResponse = await fetch('https://api.firecrawl.dev/v2/search', {
+          const baseUrl = firecrawlBaseUrl.endsWith('/')
+            ? firecrawlBaseUrl.slice(0, -1)
+            : firecrawlBaseUrl
+          const searchEndpoint = `${baseUrl}/v2/search`
+
+          const searchResponse = await fetch(searchEndpoint, {
             method: 'POST',
             headers: {
               'Authorization': `Bearer ${firecrawlApiKey}`,
@@ -282,9 +306,9 @@ export async function POST(request: Request) {
             ]
           }
           
-          // Stream the text generation using Groq's Kimi K2 Instruct model
+          // Stream the text generation using the configured OpenAI-compatible model
           const result = streamText({
-            model: groq('moonshotai/kimi-k2-instruct'),
+            model: getOpenAITextModel(),
             messages: aiMessages,
             temperature: 0.7,
             maxRetries: 2
@@ -308,7 +332,7 @@ export async function POST(request: Request) {
             
           try {
             const followUpResponse = await generateText({
-              model: groq('moonshotai/kimi-k2-instruct'),
+              model: getOpenAITextModel(),
               messages: [
                 {
                   role: 'system',
@@ -343,6 +367,10 @@ export async function POST(request: Request) {
           }
           
         } catch (error) {
+          console.error('[fireplexity] search execution error', {
+            requestId,
+            message: error instanceof Error ? error.message : error
+          })
           
           // Handle specific error types
           const errorMessage = error instanceof Error ? error.message : 'Unknown error'
@@ -383,8 +411,7 @@ export async function POST(request: Request) {
               error: errorResponse.error,
               ...(errorResponse.suggestion ? { suggestion: errorResponse.suggestion } : {}),
               ...(statusCode ? { statusCode } : {})
-            },
-            transient: true
+            }
           })
         }
       }
@@ -393,6 +420,10 @@ export async function POST(request: Request) {
     return createUIMessageStreamResponse({ stream })
     
   } catch (error) {
+    console.error('[fireplexity] route error', {
+      requestId,
+      message: error instanceof Error ? error.message : error
+    })
     const errorMessage = error instanceof Error ? error.message : 'Unknown error'
     const errorStack = error instanceof Error ? error.stack : ''
     return NextResponse.json(
